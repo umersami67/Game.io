@@ -5,7 +5,10 @@ const PLAYER_START := Vector3(0.0, 1.0, 2.2)
 const JUNGLE_START := Vector3(0.0, 1.0, 7.0)
 
 @onready var player: CharacterBody3D = $Player
+@onready var hud: CanvasLayer = $HUD
+@onready var crosshair: Label = $HUD/Crosshair
 @onready var prompt_label: Label = $HUD/Prompt
+@onready var pause_hint: Label = $HUD/LoopLabel
 
 var apartment: Node3D
 var jungle: Node3D
@@ -15,16 +18,46 @@ var mirror_engaged := false
 var transitioning := false
 var escaped := false
 
+var game_started := false
+var is_paused := false
+var graphics_preset := 1
+var main_menu: ColorRect
+var pause_menu: ColorRect
+var main_graphics_option: OptionButton
+var pause_graphics_option: OptionButton
+
 func _ready() -> void:
+	# The controller must keep receiving P while the SceneTree is paused.
+	process_mode = Node.PROCESS_MODE_ALWAYS
+	player.process_mode = Node.PROCESS_MODE_PAUSABLE
+
 	_build_environment()
 	apartment = Node3D.new()
 	apartment.name = "Apartment"
 	apartment.set_script(APARTMENT_SCRIPT)
+	apartment.process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_child(apartment)
 
 	player.prompt_changed.connect(_on_prompt_changed)
 	player.interacted.connect(_on_player_interacted)
 	player.reset_to(PLAYER_START, 0.0)
+
+	_build_frontend()
+	_apply_graphics_preset(graphics_preset)
+	_show_main_menu()
+
+func _input(event: InputEvent) -> void:
+	if not game_started:
+		return
+
+	if event is InputEventKey and event.pressed and not event.echo and event.physical_keycode == KEY_P:
+		if transitioning:
+			return
+		get_viewport().set_input_as_handled()
+		if is_paused:
+			_resume_game()
+		else:
+			_pause_game()
 
 func _build_environment() -> void:
 	var world_environment := WorldEnvironment.new()
@@ -40,12 +73,223 @@ func _build_environment() -> void:
 	world_environment.environment = env
 	add_child(world_environment)
 
+func _build_frontend() -> void:
+	pause_hint.text = "P = Pause"
+	pause_hint.visible = false
+
+	main_menu = _create_menu_overlay(Color(0.015, 0.017, 0.021, 0.98))
+	main_menu.name = "MainMenu"
+	hud.add_child(main_menu)
+	var main_box := _create_menu_box(main_menu)
+
+	var title := Label.new()
+	title.text = "THE TENANT"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.add_theme_font_size_override("font_size", 44)
+	main_box.add_child(title)
+
+	var subtitle := Label.new()
+	subtitle.text = "PSYCHOLOGICAL HORROR"
+	subtitle.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	subtitle.modulate = Color(0.68, 0.69, 0.72, 1.0)
+	subtitle.add_theme_font_size_override("font_size", 14)
+	main_box.add_child(subtitle)
+
+	var spacer := Control.new()
+	spacer.custom_minimum_size = Vector2(1.0, 24.0)
+	main_box.add_child(spacer)
+
+	var start_button := _make_menu_button("START GAME")
+	start_button.pressed.connect(_start_game)
+	main_box.add_child(start_button)
+
+	var graphics_label := Label.new()
+	graphics_label.text = "GRAPHICS"
+	graphics_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	graphics_label.add_theme_font_size_override("font_size", 16)
+	main_box.add_child(graphics_label)
+
+	main_graphics_option = _make_graphics_option()
+	main_graphics_option.item_selected.connect(_on_graphics_selected)
+	main_box.add_child(main_graphics_option)
+
+	var controls := Label.new()
+	controls.text = "WASD Move   •   Mouse Look   •   E Interact   •   P Pause"
+	controls.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	controls.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	controls.modulate = Color(0.62, 0.63, 0.66, 1.0)
+	controls.add_theme_font_size_override("font_size", 13)
+	main_box.add_child(controls)
+
+	pause_menu = _create_menu_overlay(Color(0.01, 0.012, 0.016, 0.90))
+	pause_menu.name = "PauseMenu"
+	pause_menu.visible = false
+	hud.add_child(pause_menu)
+	var pause_box := _create_menu_box(pause_menu)
+
+	var paused_title := Label.new()
+	paused_title.text = "PAUSED"
+	paused_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	paused_title.add_theme_font_size_override("font_size", 38)
+	pause_box.add_child(paused_title)
+
+	var resume_button := _make_menu_button("RESUME")
+	resume_button.pressed.connect(_resume_game)
+	pause_box.add_child(resume_button)
+
+	var pause_graphics_label := Label.new()
+	pause_graphics_label.text = "GRAPHICS"
+	pause_graphics_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	pause_graphics_label.add_theme_font_size_override("font_size", 16)
+	pause_box.add_child(pause_graphics_label)
+
+	pause_graphics_option = _make_graphics_option()
+	pause_graphics_option.item_selected.connect(_on_graphics_selected)
+	pause_box.add_child(pause_graphics_option)
+
+	var pause_help := Label.new()
+	pause_help.text = "Press P again to resume"
+	pause_help.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	pause_help.modulate = Color(0.62, 0.63, 0.66, 1.0)
+	pause_help.add_theme_font_size_override("font_size", 13)
+	pause_box.add_child(pause_help)
+
+	_sync_graphics_selectors()
+
+func _create_menu_overlay(color: Color) -> ColorRect:
+	var overlay := ColorRect.new()
+	overlay.color = color
+	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	overlay.process_mode = Node.PROCESS_MODE_ALWAYS
+	return overlay
+
+func _create_menu_box(overlay: Control) -> VBoxContainer:
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay.add_child(center)
+
+	var panel := PanelContainer.new()
+	panel.custom_minimum_size = Vector2(440.0, 390.0)
+	center.add_child(panel)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 42)
+	margin.add_theme_constant_override("margin_top", 36)
+	margin.add_theme_constant_override("margin_right", 42)
+	margin.add_theme_constant_override("margin_bottom", 36)
+	panel.add_child(margin)
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 16)
+	margin.add_child(box)
+	return box
+
+func _make_menu_button(text_value: String) -> Button:
+	var button := Button.new()
+	button.text = text_value
+	button.custom_minimum_size = Vector2(340.0, 54.0)
+	button.add_theme_font_size_override("font_size", 18)
+	return button
+
+func _make_graphics_option() -> OptionButton:
+	var option := OptionButton.new()
+	option.custom_minimum_size = Vector2(340.0, 48.0)
+	option.add_item("Low", 0)
+	option.add_item("Medium", 1)
+	option.add_item("High", 2)
+	option.select(graphics_preset)
+	return option
+
+func _show_main_menu() -> void:
+	game_started = false
+	is_paused = false
+	get_tree().paused = false
+	main_menu.visible = true
+	pause_menu.visible = false
+	crosshair.visible = false
+	prompt_label.visible = false
+	pause_hint.visible = false
+	player.set_physics_process(false)
+	player.set_process_unhandled_input(false)
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+
+func _start_game() -> void:
+	game_started = true
+	is_paused = false
+	main_menu.visible = false
+	pause_menu.visible = false
+	crosshair.visible = true
+	prompt_label.visible = true
+	pause_hint.visible = true
+	player.set_physics_process(true)
+	player.set_process_unhandled_input(true)
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+func _pause_game() -> void:
+	if not game_started or is_paused:
+		return
+	is_paused = true
+	get_tree().paused = true
+	pause_menu.visible = true
+	crosshair.visible = false
+	prompt_label.visible = false
+	pause_hint.visible = false
+	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
+
+func _resume_game() -> void:
+	if not game_started:
+		return
+	is_paused = false
+	get_tree().paused = false
+	pause_menu.visible = false
+	crosshair.visible = true
+	prompt_label.visible = true
+	pause_hint.visible = true
+	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
+
+func _on_graphics_selected(index: int) -> void:
+	graphics_preset = clampi(index, 0, 2)
+	_apply_graphics_preset(graphics_preset)
+	_sync_graphics_selectors()
+
+func _sync_graphics_selectors() -> void:
+	if is_instance_valid(main_graphics_option):
+		main_graphics_option.select(graphics_preset)
+	if is_instance_valid(pause_graphics_option):
+		pause_graphics_option.select(graphics_preset)
+
+func _apply_graphics_preset(preset: int) -> void:
+	var viewport := get_viewport()
+	match preset:
+		0:
+			viewport.scaling_3d_scale = 0.65
+			viewport.msaa_3d = Viewport.MSAA_DISABLED
+			viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_DISABLED
+			_set_light_shadows(self, false)
+		1:
+			viewport.scaling_3d_scale = 0.85
+			viewport.msaa_3d = Viewport.MSAA_DISABLED
+			viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA
+			_set_light_shadows(self, true)
+		2:
+			viewport.scaling_3d_scale = 1.0
+			viewport.msaa_3d = Viewport.MSAA_4X
+			viewport.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA
+			_set_light_shadows(self, true)
+
+func _set_light_shadows(node: Node, enabled: bool) -> void:
+	for child in node.get_children():
+		if child is Light3D:
+			(child as Light3D).shadow_enabled = enabled
+		_set_light_shadows(child, enabled)
+
 func _on_prompt_changed(text: String) -> void:
-	if not transitioning:
+	if not transitioning and game_started and not is_paused:
 		prompt_label.text = text
 
 func _on_player_interacted(target: Object) -> void:
-	if transitioning or escaped or not target.has_meta("kind"):
+	if transitioning or escaped or is_paused or not target.has_meta("kind"):
 		return
 
 	match str(target.get_meta("kind")):
@@ -107,6 +351,7 @@ func _escape_to_jungle() -> void:
 
 	_build_jungle_escape()
 	_set_jungle_environment()
+	_apply_graphics_preset(graphics_preset)
 	player.reset_to(JUNGLE_START, PI)
 
 	await get_tree().create_timer(3.0).timeout
@@ -132,6 +377,7 @@ func _set_jungle_environment() -> void:
 func _build_jungle_escape() -> void:
 	jungle = Node3D.new()
 	jungle.name = "JungleEscape"
+	jungle.process_mode = Node.PROCESS_MODE_PAUSABLE
 	add_child(jungle)
 
 	_create_static_box(jungle, "Ground", Vector3(0.0, -0.25, 0.0), Vector3(30.0, 0.5, 30.0), Color("111b13"))
